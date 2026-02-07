@@ -1,312 +1,339 @@
-mod client_id;
 mod config;
 mod extractor;
-mod server_client;
-mod system_info;
 
 use config::Config;
-use extractor::Extractor;
+use eframe::egui;
+use extractor::{ExtractionProgress, ExtractionStatus, Extractor};
 use log::{error, info};
-use server_client::ServerClient;
+use rfd::FileDialog;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Duration;
+use tokio::runtime::Runtime;
 use tokio::sync::RwLock;
-use tokio::time;
 
-#[derive(Clone)]
-struct AppState {
-    config: Arc<RwLock<Config>>,
-    server_client: Arc<ServerClient>,
-    current_extraction: Arc<RwLock<Option<Arc<Extractor>>>>,
+#[cfg(windows)]
+use winreg::enums::*;
+#[cfg(windows)]
+use winreg::RegKey;
+
+struct FitGirlClientApp {
+    config: Config,
+    runtime: Arc<Runtime>,
+
+    // UI State
+    selected_archive: Option<PathBuf>,
+    selected_destination: Option<PathBuf>,
+    is_extracting: bool,
+    current_progress: Option<Arc<RwLock<ExtractionProgress>>>,
+    status_message: String,
+
+    // Settings
+    show_settings: bool,
+    server_url: String,
+    run_on_startup: bool,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Initialize logger
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
-        .init();
+impl Default for FitGirlClientApp {
+    fn default() -> Self {
+        env_logger::Builder::from_default_env()
+            .filter_level(log::LevelFilter::Info)
+            .init();
 
-    info!("FitGirl Client Agent starting...");
+        let config = Config::load().unwrap_or_else(|e| {
+            error!("Failed to load config: {}", e);
+            Config::default()
+        });
 
-    // Load or create configuration
-    let mut config = Config::load()?;
+        let runtime = Arc::new(Runtime::new().expect("Failed to create Tokio runtime"));
 
-    // Generate or load client ID
-    let client_id = client_id::generate_or_load_client_id(&mut config);
-    info!("Client ID: {}", client_id);
+        Self {
+            server_url: config.server.url.clone(),
+            run_on_startup: is_in_startup(),
+            config,
+            runtime,
+            selected_archive: None,
+            selected_destination: None,
+            is_extracting: false,
+            current_progress: None,
+            status_message: "Ready".to_string(),
+            show_settings: false,
+        }
+    }
+}
 
-    // Create server client
-    let server_client = Arc::new(ServerClient::new(config.server.url.clone()));
+impl eframe::App for FitGirlClientApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        egui::CentralPanel::default().show(ctx, |ui| {
+            ui.heading("FitGirl Client Agent");
 
-    // Create app state
-    let state = AppState {
-        config: Arc::new(RwLock::new(config.clone())),
-        server_client: server_client.clone(),
-        current_extraction: Arc::new(RwLock::new(None)),
+            ui.add_space(10.0);
+
+            // Explanation (2 sentences max)
+            ui.label(egui::RichText::new(
+                "This app extracts game archives (.zip, .7z) to your chosen location. \
+                It needs access to your files to read archives and write extracted files."
+            ).italics().color(egui::Color32::GRAY));
+
+            ui.add_space(20.0);
+
+            // Tabs
+            ui.horizontal(|ui| {
+                ui.selectable_value(&mut self.show_settings, false, "📦 Extract");
+                ui.selectable_value(&mut self.show_settings, true, "⚙ Settings");
+            });
+
+            ui.separator();
+            ui.add_space(10.0);
+
+            if self.show_settings {
+                self.show_settings_tab(ui);
+            } else {
+                self.show_extract_tab(ui, ctx);
+            }
+        });
+    }
+}
+
+impl FitGirlClientApp {
+    fn show_extract_tab(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+        // File picker
+        ui.horizontal(|ui| {
+            ui.label("Archive:");
+            if ui.button("📂 Select File...").clicked() {
+                if let Some(path) = FileDialog::new()
+                    .add_filter("Archives", &["zip", "7z"])
+                    .pick_file()
+                {
+                    self.selected_archive = Some(path);
+                }
+            }
+        });
+
+        if let Some(ref archive) = self.selected_archive {
+            ui.label(format!("  → {}", archive.display()));
+        } else {
+            ui.label(egui::RichText::new("  No file selected").italics().weak());
+        }
+
+        ui.add_space(10.0);
+
+        // Destination picker
+        ui.horizontal(|ui| {
+            ui.label("Extract to:");
+            if ui.button("📁 Select Folder...").clicked() {
+                if let Some(path) = FileDialog::new().pick_folder() {
+                    self.selected_destination = Some(path);
+                }
+            }
+        });
+
+        if let Some(ref dest) = self.selected_destination {
+            ui.label(format!("  → {}", dest.display()));
+        } else {
+            ui.label(egui::RichText::new("  No folder selected").italics().weak());
+        }
+
+        ui.add_space(20.0);
+
+        // Extract button
+        let can_extract = self.selected_archive.is_some()
+            && self.selected_destination.is_some()
+            && !self.is_extracting;
+
+        if ui.add_enabled(can_extract, egui::Button::new("▶ Extract")).clicked() {
+            self.start_extraction(ctx);
+        }
+
+        ui.add_space(20.0);
+
+        // Progress
+        if let Some(ref progress) = self.current_progress {
+            let runtime = self.runtime.clone();
+            let prog = runtime.block_on(async {
+                progress.read().await.clone()
+            });
+
+            ui.separator();
+            ui.add_space(10.0);
+
+            ui.label(egui::RichText::new(&self.status_message).strong());
+
+            let progress_fraction = prog.progress_percent / 100.0;
+            let progress_bar = egui::ProgressBar::new(progress_fraction as f32)
+                .text(format!("{:.1}%", prog.progress_percent));
+            ui.add(progress_bar);
+
+            ui.label(format!(
+                "Speed: {:.2} MB/s | ETA: {}s | {}/{} bytes",
+                prog.speed_mbps,
+                prog.eta_seconds,
+                prog.extracted_bytes,
+                prog.total_bytes
+            ));
+
+            // Check if extraction is complete
+            if matches!(prog.status, ExtractionStatus::Completed | ExtractionStatus::Failed) {
+                self.is_extracting = false;
+
+                if matches!(prog.status, ExtractionStatus::Completed) {
+                    self.status_message = "✅ Extraction completed!".to_string();
+                } else {
+                    self.status_message = "❌ Extraction failed!".to_string();
+                }
+
+                self.current_progress = None;
+            }
+
+            // Request repaint for smooth progress updates
+            ctx.request_repaint();
+        } else if !self.is_extracting {
+            ui.label(egui::RichText::new(&self.status_message).color(egui::Color32::DARK_GRAY));
+        }
+    }
+
+    fn show_settings_tab(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Settings");
+        ui.add_space(10.0);
+
+        // Server URL
+        ui.horizontal(|ui| {
+            ui.label("Server URL:");
+            ui.text_edit_singleline(&mut self.server_url);
+        });
+
+        ui.add_space(10.0);
+
+        // Startup option
+        if ui.checkbox(&mut self.run_on_startup, "🚀 Run on Windows startup").changed() {
+            if self.run_on_startup {
+                add_to_startup();
+            } else {
+                remove_from_startup();
+            }
+        }
+
+        ui.add_space(20.0);
+
+        // Save button
+        if ui.button("💾 Save Settings").clicked() {
+            self.config.server.url = self.server_url.clone();
+            if let Err(e) = self.config.save() {
+                error!("Failed to save config: {}", e);
+                self.status_message = format!("Failed to save settings: {}", e);
+            } else {
+                self.status_message = "Settings saved!".to_string();
+                info!("Settings saved");
+            }
+        }
+
+        ui.add_space(20.0);
+        ui.separator();
+
+        // Info
+        ui.label(format!("Client ID: {}", self.config.client.id));
+        ui.label(format!("Client Name: {}", self.config.client.name));
+        ui.label(format!("Version: {}", env!("CARGO_PKG_VERSION")));
+    }
+
+    fn start_extraction(&mut self, ctx: &egui::Context) {
+        let archive = self.selected_archive.clone().unwrap();
+        let destination = self.selected_destination.clone().unwrap();
+
+        self.is_extracting = true;
+        self.status_message = "Starting extraction...".to_string();
+
+        let extractor = Arc::new(Extractor::new(archive.to_string_lossy().to_string()));
+        let progress = extractor.get_progress();
+        self.current_progress = Some(progress.clone());
+
+        // Spawn extraction task
+        let runtime = self.runtime.clone();
+        let archive_clone = archive.clone();
+        let destination_clone = destination.clone();
+        let ctx_clone = ctx.clone();
+
+        std::thread::spawn(move || {
+            runtime.block_on(async move {
+                info!("Starting extraction: {:?} -> {:?}", archive_clone, destination_clone);
+
+                match extractor.extract(&archive_clone, &destination_clone).await {
+                    Ok(_) => {
+                        info!("Extraction completed successfully");
+                    }
+                    Err(e) => {
+                        error!("Extraction failed: {}", e);
+                    }
+                }
+
+                // Request final UI update
+                ctx_clone.request_repaint();
+            });
+        });
+    }
+}
+
+// Windows startup functions
+#[cfg(windows)]
+fn add_to_startup() {
+    let exe_path = std::env::current_exe().unwrap();
+    let exe_path_str = exe_path.to_string_lossy();
+
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run_key) = hkcu.open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Run", KEY_SET_VALUE) {
+        if let Err(e) = run_key.set_value("FitGirlClient", &exe_path_str.as_ref()) {
+            error!("Failed to add to startup: {}", e);
+        } else {
+            info!("Added to Windows startup");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn remove_from_startup() {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run_key) = hkcu.open_subkey_with_flags("Software\\Microsoft\\Windows\\CurrentVersion\\Run", KEY_SET_VALUE) {
+        if let Err(e) = run_key.delete_value("FitGirlClient") {
+            error!("Failed to remove from startup: {}", e);
+        } else {
+            info!("Removed from Windows startup");
+        }
+    }
+}
+
+#[cfg(windows)]
+fn is_in_startup() -> bool {
+    let hkcu = RegKey::predef(HKEY_CURRENT_USER);
+    if let Ok(run_key) = hkcu.open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Run") {
+        run_key.get_value::<String, _>("FitGirlClient").is_ok()
+    } else {
+        false
+    }
+}
+
+#[cfg(not(windows))]
+fn add_to_startup() {}
+
+#[cfg(not(windows))]
+fn remove_from_startup() {}
+
+#[cfg(not(windows))]
+fn is_in_startup() -> bool { false }
+
+fn main() -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([600.0, 500.0])
+            .with_min_inner_size([500.0, 400.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(&include_bytes!("../assets/icon.png")[..])
+                    .unwrap_or_default(),
+            ),
+        ..Default::default()
     };
 
-    // Register with server
-    if config.server.enabled {
-        match register_with_server(&state).await {
-            Ok(_) => info!("Successfully registered with server"),
-            Err(e) => error!("Failed to register with server: {}", e),
-        }
-    }
-
-    // Start background tasks
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        poll_download_queue(state_clone).await;
-    });
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        report_system_info_periodically(state_clone).await;
-    });
-
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        watch_extraction_folder(state_clone).await;
-    });
-
-    // Keep main thread alive
-    info!("Client agent running. Press Ctrl+C to exit.");
-    tokio::signal::ctrl_c().await?;
-
-    info!("Shutting down...");
-    Ok(())
-}
-
-async fn register_with_server(state: &AppState) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = state.config.read().await;
-
-    let sys_info = system_info::gather_system_info(
-        &config.client.id,
-        &config.client.name,
-    );
-
-    state
-        .server_client
-        .register(&config.client.id, &config.client.name, &sys_info.os_version)
-        .await?;
-
-    Ok(())
-}
-
-async fn poll_download_queue(state: AppState) {
-    let mut interval = time::interval(Duration::from_secs(
-        state.config.read().await.server.poll_interval_secs,
-    ));
-
-    loop {
-        interval.tick().await;
-
-        if !state.config.read().await.server.enabled {
-            continue;
-        }
-
-        // Check if server is reachable
-        if !state.server_client.health_check().await {
-            continue;
-        }
-
-        let config = state.config.read().await;
-        let client_id = config.client.id.clone();
-        drop(config);
-
-        // Get download queue from server
-        match state.server_client.get_download_queue(&client_id).await {
-            Ok(queue) => {
-                if !queue.is_empty() {
-                    info!("Received {} items in download queue", queue.len());
-
-                    // Process each item
-                    for item in queue {
-                        info!("Processing: {}", item.game_title);
-
-                        let file_path = PathBuf::from(&item.file_path);
-                        if !file_path.exists() {
-                            error!("File not found: {}", item.file_path);
-                            continue;
-                        }
-
-                        // Start extraction
-                        if let Err(e) = start_extraction(&state, file_path, item).await {
-                            error!("Extraction failed: {}", e);
-                        }
-                    }
-                }
-            }
-            Err(e) => error!("Failed to get download queue: {}", e),
-        }
-    }
-}
-
-async fn start_extraction(
-    state: &AppState,
-    archive_path: PathBuf,
-    queue_item: server_client::DownloadQueueItem,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let config = state.config.read().await;
-    let output_dir = config.extraction.output_dir.join(&queue_item.game_title);
-    let verify_md5 = config.extraction.verify_md5;
-    let client_id = config.client.id.clone();
-    drop(config);
-
-    info!("Extracting {} to {:?}", queue_item.game_title, output_dir);
-
-    let extractor = Arc::new(Extractor::new(archive_path.to_string_lossy().to_string()));
-
-    // Store current extraction
-    {
-        let mut current = state.current_extraction.write().await;
-        *current = Some(extractor.clone());
-    }
-
-    // Start progress reporting task
-    let progress = extractor.get_progress();
-    let server_client = state.server_client.clone();
-    let client_id_clone = client_id.clone();
-
-    tokio::spawn(async move {
-        let mut interval = time::interval(Duration::from_secs(2));
-
-        loop {
-            interval.tick().await;
-
-            let prog = progress.read().await;
-            if matches!(
-                prog.status,
-                extractor::ExtractionStatus::Completed | extractor::ExtractionStatus::Failed
-            ) {
-                break;
-            }
-
-            let _ = server_client.report_progress(&client_id_clone, &prog).await;
-        }
-    });
-
-    // Perform extraction
-    extractor.extract(&archive_path, &output_dir).await?;
-
-    info!("Extraction completed: {}", queue_item.game_title);
-
-    // Verify MD5 if provided
-    if verify_md5 {
-        if let Some(expected_md5) = queue_item.expected_md5 {
-            info!("Verifying MD5...");
-
-            match extractor.verify_md5(&output_dir, &expected_md5).await {
-                Ok(true) => info!("MD5 verification passed"),
-                Ok(false) => error!("MD5 verification failed!"),
-                Err(e) => error!("MD5 verification error: {}", e),
-            }
-        }
-    }
-
-    // Clear current extraction
-    {
-        let mut current = state.current_extraction.write().await;
-        *current = None;
-    }
-
-    Ok(())
-}
-
-async fn report_system_info_periodically(state: AppState) {
-    let mut interval = time::interval(Duration::from_secs(60));
-
-    loop {
-        interval.tick().await;
-
-        if !state.config.read().await.server.enabled {
-            continue;
-        }
-
-        let config = state.config.read().await;
-        let sys_info = system_info::gather_system_info(
-            &config.client.id,
-            &config.client.name,
-        );
-        drop(config);
-
-        if let Err(e) = state.server_client.report_system_info(&sys_info).await {
-            error!("Failed to report system info: {}", e);
-        }
-    }
-}
-
-async fn watch_extraction_folder(state: AppState) {
-    let mut interval = time::interval(Duration::from_secs(5));
-
-    loop {
-        interval.tick().await;
-
-        // Check if there's already an extraction in progress
-        {
-            let current = state.current_extraction.read().await;
-            if current.is_some() {
-                continue;
-            }
-        }
-
-        // Scan watch directory for archives
-        let config = state.config.read().await;
-        let watch_dir = config.extraction.watch_dir.clone();
-        drop(config);
-
-        if !watch_dir.exists() {
-            continue;
-        }
-
-        // Look for archive files
-        if let Ok(entries) = std::fs::read_dir(&watch_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-
-                if !path.is_file() {
-                    continue;
-                }
-
-                let extension = path
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("")
-                    .to_lowercase();
-
-                if matches!(extension.as_str(), "zip" | "7z") {
-                    info!("Found archive in watch folder: {:?}", path);
-
-                    // Auto-extract
-                    let queue_item = server_client::DownloadQueueItem {
-                        game_id: 0,
-                        game_title: path
-                            .file_stem()
-                            .and_then(|s| s.to_str())
-                            .unwrap_or("Unknown")
-                            .to_string(),
-                        file_path: path.to_string_lossy().to_string(),
-                        expected_md5: None,
-                    };
-
-                    if let Err(e) = start_extraction(&state, path.clone(), queue_item).await {
-                        error!("Auto-extraction failed: {}", e);
-                    } else {
-                        // Move to processed folder to avoid re-extraction
-                        let processed_dir = watch_dir.join("processed");
-                        if std::fs::create_dir_all(&processed_dir).is_ok() {
-                            let new_path = processed_dir.join(path.file_name().unwrap());
-                            if let Err(e) = std::fs::rename(&path, &new_path) {
-                                error!("Failed to move processed archive: {}", e);
-                            } else {
-                                info!("Moved processed archive to: {:?}", new_path);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    eframe::run_native(
+        "FitGirl Client Agent",
+        options,
+        Box::new(|_cc| Ok(Box::new(FitGirlClientApp::default()))),
+    )
 }
